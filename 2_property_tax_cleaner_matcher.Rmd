@@ -24,6 +24,8 @@ getmode <- function(v) {
    uniqv[which.max(tabulate(match(v, uniqv)))]
 }
 
+#Download the same map that was used in the scraper script to get the list of 
+#PINs, but now download the file as a geojson. #https://datacatalog.cookcountyil.gov/GIS-Maps/ccgisdata-Parcels-2016/a33b-b59u
 parcels <- geojson_sf("Parcels.geojson")
 
 drv <- dbDriver("PostgreSQL")
@@ -107,6 +109,8 @@ rm(parcels)
 ### Join the clean records with the community areas
 
 This chunk only converts the records into a spatial object long enough to merge them with the community area and township map, then converts the records back into a tibble. Running the matching code on the spatial object is dozens of times slower.
+The map for community areas is from https://data.cityofchicago.org/Facilities-Geographic-Boundaries/Boundaries-Community-Areas-current-/cauq-8yn6
+and the map for townships is from https://datacatalog.cookcountyil.gov/GIS-Maps/Historical-ccgisdata-Political-Township-2016/uvx8-ftf4
 
 ```{r}
 townships <-
