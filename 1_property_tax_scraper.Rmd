@@ -1,0 +1,142 @@
+---
+title: "Property Scraper"
+author: "Theo Noomah"
+date: "November 23, 2019"
+output: html_document
+---
+---
+```{r}
+library(RPostgreSQL)
+library(tidyverse)
+library(rvest)
+library(httr)
+library(purrr)
+library(furrr)
+library(data.table)
+```
+
+## Set up your database
+This property scraping code uses a Postgres (PostgreSQL) database to save property records to as they are scraped. There are 1.4 million property records and the scraping can take a while, during which time R could crash. One could modify this code to run solely in R, but I recommend setting up and using a Postgres database (https://www.postgresql.org/) becase it ensures that  you won't lose your scraping progress in the case of a crash.
+
+After setting up Postgres, just open postgres and create a database via Terminal, which you can do in RStudio, if you're using it, with:
+
+psql "host = localhost user = postgres password= <your password> port= <your port> "
+
+CREATE DATABASE chicago_parcels;
+
+## Set your database as your database connection
+```{r}
+drv <- dbDriver("PostgreSQL")
+
+con <- dbConnect(drv, dbname = "chicago_parcels", user = "postgres", port = "",
+                 host = "localhost", password = "")
+```
+
+## Set up your database table
+```{sql, connection = con}
+CREATE TABLE public.temprecords
+(
+    address character varying COLLATE pg_catalog."default",
+    owner character varying COLLATE pg_catalog."default",
+    owner_mail1 character varying COLLATE pg_catalog."default",
+    owner_mail2 character varying COLLATE pg_catalog."default",
+    "PIN" character varying COLLATE pg_catalog."default",
+    lot character varying COLLATE pg_catalog."default",
+    total_value character varying COLLATE pg_catalog."default",
+    class character varying COLLATE pg_catalog."default"
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE public.temprecords
+    OWNER to postgres;
+```
+
+## Load the list of parcels
+Download parcel data as a .csv file via:
+https://datacatalog.cookcountyil.gov/GIS-Maps/ccgisdata-Parcels-2016/a33b-b59u
+```{r}
+parcels <- fread("parcels.csv", data.table = FALSE)
+```
+
+## Scraping Function
+This function scrapes the Cook County Property Tax Records Portal, the following
+link is an example showing what is on the page to collect:
+http://www.cookcountypropertyinfo.com/cookviewerpinresults.aspx?pin=20113020200000
+
+I use the GET function with a timeout option of 1 second. Not every PIN has a webpage so it's necessary to move on from errors quickly.
+```{r}
+property_base <- 
+  "http://www.cookcountypropertyinfo.com/cookviewerpinresults.aspx?pin="
+
+scraper <- function(pin) {
+    profile <- GET(str_c(property_base, pin), timeout(1)) %>% read_html()
+    data.frame(address = profile %>% 
+                 html_node("#ContentPlaceHolder1_PropertyInfo_propertyAddress") %>% 
+                 html_text(),
+               owner = profile %>% 
+                 html_node("#ContentPlaceHolder1_PropertyInfo_propertyMailingName") %>% 
+                 html_text(),
+               owner_mail1 = profile %>% 
+                 html_node("#ContentPlaceHolder1_PropertyInfo_propertyMailingAddress") %>%
+                 html_text(),
+               owner_mail2 = profile %>% 
+                 html_node("#ContentPlaceHolder1_PropertyInfo_propertyMailingCityStateZip") %>%
+                 html_text(),
+               PIN = profile %>% 
+                 html_node("#ContentPlaceHolder1_lblResultTitle") %>%
+                 html_text(),
+               lot = profile %>% 
+                 html_node("#ContentPlaceHolder1_TaxYearInfo_propertyLotSize") %>%
+                 html_text(),
+               total_value = profile %>% 
+                 html_node("#ContentPlaceHolder1_TaxYearInfo_propertyAssessedValue") %>%
+                 html_text(),
+               class = profile %>%
+                 html_node("#ContentPlaceHolder1_TaxYearInfo_propertyClass") %>%
+                 html_text()
+               )
+}
+```
+
+
+## Apply Pager Function to Parcels (furrr package)
+Because there are so many records to scrape, this uses parallel processing with the future map function from the furrr package to speed up the process.
+
+The loop loops through the first segment of properties parcel numbers which range 1-33, splitting the 1.4 million parcels into 33 chunk. This allows you to track and save your progress.
+
+```{r}
+plan(multiprocess)
+
+for (i in 1:33){
+    start_time <- Sys.time()
+  
+    pinslist <- 
+      parcels %>% 
+      filter(PINA == i) %>% 
+      .$Name %>% 
+      as.list()
+  
+    records <- 
+      suppressWarnings(
+        as_tibble(
+          do.call(rbind, purrr::transpose(
+            future_map(pinslist, safely(scraper))
+            )[["result"]])
+          )
+        )
+  
+    dbWriteTable(con, "temprecords", records, append = TRUE, row.names = FALSE)
+
+    end_time <- Sys.time()
+
+    elapsed <- end_time - start_time
+
+    print(i)                  # Just to keep track of runtime
+    print(length(pinslist))
+    print(elapsed)
+}
+```
+
+### Fin
+The next file will start by retrieving the records from the database.
