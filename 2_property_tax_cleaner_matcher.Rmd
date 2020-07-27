@@ -1,0 +1,285 @@
+---
+title: "Property Cleaner"
+author: "Theo Noomah"
+date: "November 27, 2019"
+output: html_document
+---
+---
+
+### Load packages, parcel file, drivers, notin function
+```{r}
+library(tictoc)
+library(here)
+library(data.table)
+library(RPostgreSQL)
+library(postGIStools)
+library(geojsonsf)
+library(sf)
+library(tidyverse)
+library(RJDBC)
+library(reticulate)
+`%notin%` <- Negate(`%in%`)
+getmode <- function(v) {
+   uniqv <- unique(na.omit(v))
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+parcels <- geojson_sf("Parcels.geojson")
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "chicago_parcels", user = "postgres", port = "6969",host = "localhost", password = "gtheot")
+```
+
+### Pull the scraped data from the postgres database
+```{sql connection=con, output.var = scraped_data}
+SELECT * 
+FROM temprecords
+```
+
+### Clean the data, subset to rental properties, join it with the parcels file
+
+A lot of what this cleaning does is strip the noise away from the property tax records so that they're easier to match. I strip off street abreviations, "LLC" suffixes, and trailing numbers. With these pieces gone it's possible to match "ABC Holdings" to "ABC Holdings 2" and "ABC Holdings LLC". I also add random numbers to the common bank names so that they won't match each other. 
+
+```{r}
+common_owners <- 
+  c("TAXPAYEROF", "CURRENTOWNER", 
+    "CHICAGOTITLELANDTRU", "CHICAGOTITLE&TRUST", 
+    "CHGOTITLE&TRUST", "CHGOTITLE&TR",
+    "CHGOTITLE", "CTLTC", "CTLT", "CTLTCA", "CTLTCB", "CTLTCCT",
+    "CTLTCPNB", "TRUST", "FEDERALNATIONALMTG", 
+    "FEDERALHOMELOANMTG", "DEUTSCHEBANKNATIONAL", 
+    "USBANKNATIONAL", "WELLSFARGOBANKNA", 
+    "WILMINGTONSAVINGSFUN")
+
+street_abvs <- " AVE| AV| ST| BLVD| STE| DR|#| LN| DRI| TER| PL| STREET| CT| RD| CIRCLE| ROAD| LANE| TRAIL| WAY|DRIVE| PK| AVENUE| PLACE| HWY| COURT| CIR| PKWY"
+
+clean_records <- 
+  unique(scraped_data) %>% 
+  filter(is.na(PIN) == FALSE) %>% 
+  mutate(pin10 = 
+           str_c(substr(PIN, 1,2), 
+                 substr(PIN, 4,5), 
+                 substr(PIN, 7,9), 
+                 substr(PIN, 11,13))) %>%
+  mutate(class = as.numeric(gsub("[^0-9]", "", class))) %>%
+  filter(class %in% c(211, 212, 313:321, 390, 391, 396, 397, 399, 
+            900, 901, 913:918, 959, 990, 991, 996, 997)) %>% 
+  select(c(address, owner, owner_mail1, owner_mail2, lot,
+           total_value, class, pin10)) %>%
+  mutate(lot = as.numeric(gsub("[^0-9]", "", lot))) %>%
+  mutate(total_value = as.numeric(gsub("[^0-9]", "", total_value)))%>%
+  mutate(trimmed_owner = str_to_upper(owner)) %>%
+  mutate(trimmed_owner = ifelse(str_detect(trimmed_owner, ".{6,21}LLC"),
+    gsub("LLC.*$", "", trimmed_owner), trimmed_owner)) %>%
+  mutate(trimmed_owner = gsub("L{1,3}P$", "", trimmed_owner)) %>%
+  mutate(trimmed_owner = gsub("LTD$", "", trimmed_owner)) %>%
+  mutate(trimmed_owner = gsub("INC$", "", trimmed_owner)) %>%
+  mutate(trimmed_owner = 
+           ifelse(!str_detect(trimmed_owner, str_extract(address, "[A-Z]{4,}")) 
+                              & !is.na(str_extract(address, "[A-Z]{4,}")),
+    gsub("\\d+\\D{0,4}$", "", trimmed_owner), trimmed_owner)) %>%
+  mutate(trimmed_owner = gsub(" ", "", trimmed_owner)) %>%
+  mutate(trimmed_owner = ifelse(trimmed_owner %in% common_owners, 
+                        str_c(trimmed_owner, rnorm(n())),
+                              trimmed_owner)) %>%
+  mutate(trimmed_owner = ifelse(str_length(trimmed_owner) < 4, 
+                                owner, trimmed_owner)) %>%
+  mutate(trimmed_mail1 = str_to_upper(owner_mail1)) %>%
+  mutate(trimmed_mail1 = gsub("\\.", "", trimmed_mail1)) %>%
+  mutate(trimmed_mail1 = gsub(street_abvs, "", trimmed_mail1)) %>%
+  mutate(trimmed_mail1 = gsub(" ", "", trimmed_mail1)) %>%
+  mutate(trimmed_mail1 = ifelse(str_detect(trimmed_mail1, "POBOX"), 
+                                str_c(trimmed_mail1, owner_mail2),
+                                trimmed_mail1)) %>%
+  mutate(trimmed_mail1 = ifelse(trimmed_mail1 == "10SLASALLE2750", 
+                        str_c(trimmed_mail1, rnorm(n())),
+                              trimmed_mail1)) %>%
+  left_join(parcels, by = c("pin10" = "pin10")) %>%
+  select(c(address, owner, owner_mail1, owner_mail2, trimmed_owner, 
+           trimmed_mail1, lot, total_value, class, pin10, geometry)) %>%
+  unique()
+
+rm(scraped_data)
+rm(parcels)
+```
+
+### Make the community area map from townships and community areas
+### Join the clean records with the community areas
+
+This chunk only converts the records into a spatial object long enough to merge them with the community area and township map, then converts the records back into a tibble. Running the matching code on the spatial object is dozens of times slower.
+
+```{r}
+townships <-
+  geojson_sf("townships.geojson") %>%
+  select("name", "geometry") %>%
+  mutate(designation = "township") %>%
+  filter(name %notin% c("ROGERS PARK", "JEFFERSON", "LAKE VIEW", "NORTH",
+                        "WEST", "SOUTH", "HYDE PARK", "LAKE"))
+
+community_areas <-
+  geojson_sf("community_areas.geojson") %>%
+  select("name" = community, "geometry") %>%
+  mutate(designation = "community area") %>%
+  rbind(townships) %>%
+  rename(community_area = name)
+
+rm(townships)
+
+clean_records <- 
+  st_join(st_as_sf(community_areas), 
+          st_as_sf(clean_records), 
+          join = st_contains)
+
+clean_records <-
+  as_tibble(clean_records) %>%
+  select(-geometry)
+```
+
+### Set up python functions, objects
+This uses the union find code by Debajyoti Nandi https://github.com/deehzee/unionfind. Here I use reticulate to run the union find code in Python (python must be installed).
+
+```{r}
+py_run_file(here("union_find.py"))
+py_run_string("import pandas as pd")
+py_run_string("uf = 0") # reset uf
+py_run_string("uf = UnionFind(r.clean_records['pin10'])")
+```
+
+### The uniter function
+The uniter function makes groups of properties with identical pieces of identifying information (name or mailing address) and logs 
+
+```{r}
+uniter <- function(data){
+
+  d1 <- data %>% 
+    group_by(trimmed_owner) %>% 
+    summarise(n = n()) %>% 
+    filter(n >1) %>% 
+    select(trimmed_owner)
+  
+  if(nrow(d1) > 0){
+    for(h in 1:nrow(d1)){
+      sub_sample <- data %>% filter(trimmed_owner == d1$trimmed_owner[h])
+      for (i in 2:nrow(sub_sample)){
+        py$a <- r_to_py(sub_sample$pin10[1])
+        py$b <- r_to_py(sub_sample$pin10[i])
+        py_run_string("uf.union(a, b)")
+      }
+    }
+  }
+  
+  d2 <- data %>%
+    group_by(trimmed_mail1) %>%
+    summarise(n = n()) %>%
+    filter(n >1) %>%
+    select(trimmed_mail1)
+
+  if(nrow(d2) > 0){
+    for(h in 1:nrow(d2)){
+      sub_sample <- data %>% filter(trimmed_mail1 == d2$trimmed_mail1[h])
+      for (i in 2:nrow(sub_sample)){
+        py$a <- r_to_py(sub_sample$pin10[1])
+        py$b <- r_to_py(sub_sample$pin10[i])
+        py_run_string("uf.union(a, b)")
+      }
+    }
+  }
+}
+```
+
+### Apply the uniter
+```{r}
+tic()
+uniter(clean_records)
+toc()
+
+```
+
+### Map the components, convert it to a dataframe, convert it to an R object, pull the ID and the first match and join them with the existing records
+```{r}
+py_run_string("c = uf.component_mapping()")
+
+py_run_string("df = pd.DataFrame.from_dict(c, orient='index')")
+
+df <- 
+  py$df
+
+df <- 
+  setDT(df, keep.rownames = TRUE)[,1:2]
+
+colnames(df) <- 
+  c("pin10", "match")
+
+clean_records <- 
+  clean_records %>% 
+  left_join(df)
+```
+
+
+### Generate codes for each group of matches based on the most commonly shared first letter and export the dataset
+
+I  change the column names and the capitalization to export a more reader-friendly version and I make a column that counts the number of unique addresses associated with a match code. Codes with a high number of unique addresses are more likely to be bank owned or simply owned by individuals with common names. This is useful because next step is to verify the data by hand. 
+```{r}
+init_table <-
+    clean_records %>% 
+    group_by(match) %>% 
+    summarise(init = owner %>% 
+                  str_extract("[A-Z]") %>% 
+                  getmode())
+
+clean_records <-
+  clean_records %>%
+  left_join(init_table)
+
+code_table <- 
+  clean_records %>% 
+  group_by(init, match) %>% 
+  summarise(properties_held_by_owner = n()) %>%
+  mutate(rank = order(order(properties_held_by_owner, decreasing = TRUE))) %>%
+  ungroup() %>%
+  mutate(init = ifelse(is.na(init), "ZZ", init)) %>%
+  mutate(rank_0s = str_length(rank)) %>% 
+    mutate(rank_0s = recode(rank_0s,
+                             `5` = "",
+                             `4` = "0", 
+                             `3` = "00", 
+                             `2` = "000", 
+                             `1` = "0000")) %>%
+  mutate(owner_match_code = str_c(init, "-", rank_0s, rank)) %>%
+  select(c("match", "owner_match_code", "properties_held_by_owner"))
+
+clean_records <-
+  clean_records %>%
+  select(-init) %>%
+  left_join(code_table) %>%
+  select(-match)
+
+address_count_table <- 
+  clean_records %>%
+  group_by(owner_match_code, trimmed_mail1) %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(owner_match_code) %>%
+  summarise(addresses = n())
+
+clean_records <-
+  clean_records %>%
+  left_join(address_count_table)
+ 
+fwrite(clean_records, "clean_records_whole_city.csv")
+
+readable_records <-
+  clean_records %>%
+  select(c("address", "community_area", "pin10", "owner", "owner_mail1", 
+           "owner_mail2", "owner_match_code", "properties_held_by_owner")) %>%
+  mutate(address = str_to_title(address),
+         community_area = str_to_title(community_area),
+         owner = str_to_title(owner),
+         owner_mail1 = str_to_title(owner_mail1),
+         owner_mail2 = str_to_title(owner_mail2)) %>%
+  set_names("Property Address", "Community Area", "Property Index Number", 
+            "Owner", "Owner Mail 1", "Owner Mail 2", 
+            "Owner Match Code", "Properties Held by Owner")
+  
+fwrite(readable_records, "readable_records.csv")
+```
